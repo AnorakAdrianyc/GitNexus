@@ -12,8 +12,10 @@ import { isVerboseIngestionEnabled } from './utils/verbose.js';
 import { yieldToEventLoop } from './utils/event-loop.js';
 import {
   FUNCTION_NODE_TYPES,
-  extractFunctionName,
   findEnclosingClassId,
+  findEnclosingClassInfo,
+  genericFuncName,
+  inferFunctionLabel,
 } from './utils/ast-helpers.js';
 import {
   countCallArguments,
@@ -140,8 +142,10 @@ export function buildExportedTypeMapFromGraph(
     const filePath = node.properties.filePath as string;
     const name = node.properties.name as string;
     if (!name || name.length > MAX_TYPE_NAME_LENGTH) return;
-    // For callable symbols, use returnType; for properties/variables, use declaredType
-    const def = symbolTable.lookupExactFull(filePath, name);
+    // For callable symbols, use returnType; for properties/variables, use declaredType.
+    // Use lookupExactAll + nodeId match to handle same-name methods in different classes.
+    const defs = symbolTable.lookupExactAll(filePath, name);
+    const def = defs.find((d) => d.nodeId === node.id) ?? defs[0];
     if (!def) return;
     const typeName = def.returnType ?? def.declaredType;
     if (!typeName || typeName.length > MAX_TYPE_NAME_LENGTH) return;
@@ -231,21 +235,52 @@ const findEnclosingFunction = (
 
   while (current) {
     if (FUNCTION_NODE_TYPES.has(current.type)) {
-      const { funcName, label } = extractFunctionName(current);
+      const efnResult = provider.methodExtractor?.extractFunctionName?.(current);
+      const funcName = efnResult?.funcName ?? genericFuncName(current);
+      const label = efnResult?.label ?? inferFunctionLabel(current.type);
 
       if (funcName) {
         const resolved = ctx.resolve(funcName, filePath);
         if (resolved?.tier === 'same-file' && resolved.candidates.length > 0) {
+          // Disambiguate by enclosing class when multiple candidates
+          if (resolved.candidates.length === 1) {
+            return resolved.candidates[0].nodeId;
+          }
+          const classInfo = findEnclosingClassInfo(current, filePath);
+          if (classInfo) {
+            const match = resolved.candidates.find((c) => c.ownerId === classInfo.classId);
+            if (match) return match.nodeId;
+          }
+          if (process.env.NODE_ENV === 'development' && classInfo) {
+            console.warn(
+              `[CallProcessor] Enclosing class '${classInfo.className}' found but no candidate matched — falling back to ${resolved.candidates[0].nodeId}`,
+            );
+          }
           return resolved.candidates[0].nodeId;
         }
 
-        // Apply labelOverride so label matches the definition phase (single source of truth).
+        // Fallback: qualify the generated ID to match definition-phase node IDs
         let finalLabel = label;
         if (provider.labelOverride) {
           const override = provider.labelOverride(current, label);
           if (override !== null) finalLabel = override;
         }
-        return generateId(finalLabel, `${filePath}:${funcName}`);
+        const classInfo = findEnclosingClassInfo(current, filePath);
+        const qualifiedName = classInfo ? `${classInfo.className}.${funcName}` : funcName;
+        // Include #<arity> suffix to match definition-phase Method/Constructor IDs.
+        // Use provider.methodExtractor.extractFromNode — same extractor as definition phase.
+        let arity: number | undefined;
+        if (finalLabel === 'Method' || finalLabel === 'Constructor') {
+          const language = getLanguageFromFilename(filePath);
+          const info = language
+            ? provider.methodExtractor?.extractFromNode?.(current, { filePath, language })
+            : undefined;
+          if (info) {
+            arity = info.parameters.some((p) => p.isVariadic) ? undefined : info.parameters.length;
+          }
+        }
+        const arityTag = arity !== undefined ? `#${arity}` : '';
+        return generateId(finalLabel, `${filePath}:${qualifiedName}${arityTag}`);
       }
     }
 
@@ -254,9 +289,21 @@ const findEnclosingFunction = (
     if (provider.enclosingFunctionFinder) {
       const customResult = provider.enclosingFunctionFinder(current);
       if (customResult) {
-        // Try SymbolTable first (same pattern as the FUNCTION_NODE_TYPES branch above).
         const resolved = ctx.resolve(customResult.funcName, filePath);
         if (resolved?.tier === 'same-file' && resolved.candidates.length > 0) {
+          if (resolved.candidates.length === 1) {
+            return resolved.candidates[0].nodeId;
+          }
+          const classInfo = findEnclosingClassInfo(current.previousSibling ?? current, filePath);
+          if (classInfo) {
+            const match = resolved.candidates.find((c) => c.ownerId === classInfo.classId);
+            if (match) return match.nodeId;
+          }
+          if (process.env.NODE_ENV === 'development' && classInfo) {
+            console.warn(
+              `[CallProcessor] Enclosing class '${classInfo.className}' found but no candidate matched — falling back to ${resolved.candidates[0].nodeId}`,
+            );
+          }
           return resolved.candidates[0].nodeId;
         }
         let finalLabel = customResult.label;
@@ -264,7 +311,24 @@ const findEnclosingFunction = (
           const override = provider.labelOverride(current.previousSibling!, finalLabel);
           if (override !== null) finalLabel = override;
         }
-        return generateId(finalLabel, `${filePath}:${customResult.funcName}`);
+        const classInfo = findEnclosingClassInfo(current.previousSibling ?? current, filePath);
+        const qualifiedName = classInfo
+          ? `${classInfo.className}.${customResult.funcName}`
+          : customResult.funcName;
+        // Include #<arity> suffix to match definition-phase Method/Constructor IDs.
+        const sigNode = current.previousSibling ?? current;
+        let arity2: number | undefined;
+        if (finalLabel === 'Method' || finalLabel === 'Constructor') {
+          const language = getLanguageFromFilename(filePath);
+          const info = language
+            ? provider.methodExtractor?.extractFromNode?.(sigNode, { filePath, language })
+            : undefined;
+          if (info) {
+            arity2 = info.parameters.some((p) => p.isVariadic) ? undefined : info.parameters.length;
+          }
+        }
+        const arityTag2 = arity2 !== undefined ? `#${arity2}` : '';
+        return generateId(finalLabel, `${filePath}:${qualifiedName}${arityTag2}`);
       }
     }
 
@@ -565,6 +629,7 @@ export const processCalls = async (
       importedReturnTypes,
       importedRawReturnTypes,
       enclosingFunctionFinder: provider?.enclosingFunctionFinder,
+      extractFunctionName: provider?.methodExtractor?.extractFunctionName,
     });
     if (typeEnv && exportedTypeMap) {
       const fileExports = collectExportedBindings(typeEnv, file.path, ctx.symbols, graph);
@@ -805,7 +870,8 @@ export const processCalls = async (
         let p = callNode.parent;
         while (p) {
           if (FUNCTION_NODE_TYPES.has(p.type)) {
-            const { funcName } = extractFunctionName(p);
+            const funcName =
+              provider.methodExtractor?.extractFunctionName?.(p)?.funcName ?? genericFuncName(p);
             if (funcName) {
               scope = `${funcName}@${p.startIndex}`;
               break;
@@ -1347,10 +1413,18 @@ const resolveCallTarget = (
 /** Extract the function name from a scope key ("funcName@startIndex" → "funcName"). */
 const extractFuncNameFromScope = (scope: string): string => scope.slice(0, scope.indexOf('@'));
 
-/** Extract the trailing function name from a sourceId ("Function:filepath:funcName" → "funcName"). */
+/** Extract the bare function name from a sourceId.
+ *  Handles both unqualified ("Function:filepath:funcName" → "funcName")
+ *  and qualified ("Function:filepath:ClassName.funcName" → "funcName").
+ *  Strips any trailing #<arity> suffix from Method/Constructor IDs. */
 const extractFuncNameFromSourceId = (sourceId: string): string => {
   const lastColon = sourceId.lastIndexOf(':');
-  return lastColon >= 0 ? sourceId.slice(lastColon + 1) : '';
+  const segment = lastColon >= 0 ? sourceId.slice(lastColon + 1) : '';
+  const dotIdx = segment.lastIndexOf('.');
+  const raw = dotIdx >= 0 ? segment.slice(dotIdx + 1) : segment;
+  // Strip #<arity> suffix (e.g. "save#2" → "save")
+  const hashIdx = raw.indexOf('#');
+  return hashIdx >= 0 ? raw.slice(0, hashIdx) : raw;
 };
 
 /**
